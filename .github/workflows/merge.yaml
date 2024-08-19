@@ -4,32 +4,20 @@ on:
     branches:
       - 'master'
       - 'release-*'
+      - update-workflows
 jobs:
   merge_master:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Unshallow
-        run: git fetch --prune --unshallow
-      - name: Extract branch name
-        shell: bash
-        run: echo "##[set-output name=branch;]$(echo ${GITHUB_REF#refs/heads/})"
-        id: extract_branch
-      - name: Enable experimental on dockerd
-        run: |
-          echo $'{\n    "experimental": true\n}' | sudo tee /etc/docker/daemon.json
-          sudo service docker restart
       - name: Set up Docker Buildx
-        id: buildx
-        uses: crazy-max/ghaction-docker-buildx@v1
+        uses: docker/setup-buildx-action@v3.4.0
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v6.4.0
         with:
-          version: latest
-      - name: Docker login
-        run: echo ${{ secrets.DOCKER_PASSWORD }} | docker login -u ${{ secrets.DOCKER_USER }} --password-stdin
-      - name: Make release
-        run: make release
-        env:
-          DOCKER_CLI_EXPERIMENTAL: enabled
-          TAG: ${{ env.GITHUB_SHA }}
-          IMAGE_TAG: ${{ steps.extract_branch.outputs.branch }}
+          context: .
+          push: false
+          tags: example.com/fake:latest
+          platforms: linux/amd64,linux/arm/v7,linux/arm64
