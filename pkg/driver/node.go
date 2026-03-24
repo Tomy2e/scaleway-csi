@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -152,12 +153,20 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		mountOptions = append(mountOptions, "nouuid")
 	}
 
+	internalStagingPath := filepath.Join("/mnt/", volumeID)
+
 	klog.V(4).Infof("Volume %s with ID %s will be mounted on %s with type %s and options %s", volumeName, volumeID, stagingTargetPath, fsType, strings.Join(mountOptions, ","))
 
+	if err := createMountPoint(internalStagingPath, false); err != nil {
+		return nil, status.Errorf(codes.Internal, "error creating mount point %s for volume with ID %s", internalStagingPath, volumeID)
+	}
+
 	// format and mounting volume
-	if err := d.diskUtils.FormatAndMount(stagingTargetPath, devicePath, fsType, mountOptions); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to format and mount device from (%q) to (%q) with fstype (%q) and options (%q): %s",
-			devicePath, stagingTargetPath, fsType, mountOptions, err)
+	if !d.diskUtils.IsMounted(stagingTargetPath) {
+		if err := d.diskUtils.FormatAndMount(internalStagingPath, devicePath, fsType, mountOptions); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to format and mount device from (%q) to (%q) with fstype (%q) and options (%q): %s",
+				devicePath, internalStagingPath, fsType, mountOptions, err)
+		}
 	}
 
 	klog.V(4).Infof("Volume %s with ID %s has been mounted on %s with type %s and options %s", volumeName, volumeID, stagingTargetPath, fsType, strings.Join(mountOptions, ","))
@@ -165,8 +174,53 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// Try expanding the volume if it's created from a snapshot. We provide an
 	// empty password as we don't expect the size of an encrypted (or not) volume
 	// to change between the moment we open it and now, so luks resizing is useless.
-	if err := d.diskUtils.Resize(stagingTargetPath, devicePath, ""); err != nil {
+	if err := d.diskUtils.Resize(internalStagingPath, devicePath, ""); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to resize volume: %s", err)
+	}
+
+	// Create scratch folder.
+	scratchStagingPath := filepath.Join("/scratch/", volumeID)
+	if err := os.MkdirAll(scratchStagingPath, 0755); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create scratch folder: %s", err)
+	}
+
+	// Recursive copy from staging path to scratch path (if needed).
+	doneFilename := filepath.Join(scratchStagingPath, "done")
+	if _, err := os.Stat(doneFilename); errors.Is(err, fs.ErrNotExist) {
+		// os.CopyFS doesn't like files that are already present!
+		if err := RemoveGlob(scratchStagingPath + "/*"); err != nil {
+			return nil, err
+		}
+
+		if err := os.CopyFS(scratchStagingPath, os.DirFS(internalStagingPath)); err != nil {
+			return nil, fmt.Errorf("failed to copy from internal to scratch: %w", err)
+		}
+	} else if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Create(doneFilename)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, err
+	}
+
+	// Ensure SBS volume is empty to avoid recovering from stale data.
+	if err := RemoveGlob(internalStagingPath + "/*"); err != nil {
+		return nil, err
+	}
+
+	if !d.diskUtils.IsMounted(stagingTargetPath) {
+		// Bind mount.
+		if err := createMountPoint(stagingTargetPath, false); err != nil {
+			return nil, status.Errorf(codes.Internal, "error creating mount point %s for volume with ID %s", stagingTargetPath, volumeID)
+		}
+
+		if err := d.diskUtils.MountToTarget(scratchStagingPath, stagingTargetPath, fsType, []string{"bind"}); err != nil {
+			return nil, status.Errorf(codes.Internal, "error mounting source %s to target %s with fs of type %s : %s", scratchStagingPath, stagingTargetPath, fsType, err.Error())
+		}
 	}
 
 	return &csi.NodeStageVolumeResponse{}, nil
@@ -188,6 +242,28 @@ func (d *nodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		return nil, status.Error(codes.InvalidArgument, "stagingTargetPath not provided")
 	}
 
+	internalStagingPath := filepath.Join("/mnt/", volumeID)
+	scratchStagingPath := filepath.Join("/scratch/", volumeID)
+
+	doneFilename := filepath.Join(scratchStagingPath, "done")
+	if _, err := os.Stat(doneFilename); err == nil {
+		if err := RemoveGlob(internalStagingPath + "/*"); err != nil {
+			return nil, err
+		}
+
+		// Copy from scratch to internal.
+		if err := os.CopyFS(internalStagingPath, os.DirFS(scratchStagingPath)); err != nil {
+			return nil, fmt.Errorf("failed to copy from internal to scratch: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("error during stat of scratch: %w", err)
+	}
+
+	// Delete "done" file in internal.
+	if err := os.Remove(filepath.Join(internalStagingPath, "done")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+
 	if _, err = d.diskUtils.GetDevicePath(volumeID); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, status.Errorf(codes.NotFound, "volume with ID %s not found", volumeID)
@@ -205,6 +281,19 @@ func (d *nodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "error unmounting target path: %s", err.Error())
 		}
+	}
+
+	if d.diskUtils.IsMounted(internalStagingPath) {
+		klog.V(4).Infof("Volume with ID %s is mounted on %s, umounting it", volumeID, internalStagingPath)
+		err = d.diskUtils.Unmount(internalStagingPath)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "error unmounting target path: %s", err.Error())
+		}
+	}
+
+	// delete scratch dir
+	if err := os.RemoveAll(scratchStagingPath); err != nil {
+		return nil, err
 	}
 
 	if err := d.diskUtils.CloseDevice(volumeID); err != nil {
