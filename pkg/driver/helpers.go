@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/scaleway/scaleway-csi/pkg/scaleway"
@@ -546,4 +548,105 @@ func maxVolumesPerNode(reservedCount int) (int64, error) {
 	}
 
 	return int64(max), nil
+}
+
+// clearDir removes all entries inside path (including dotfiles) without
+// removing the directory itself.
+func clearDir(path string) error {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(path, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// copyDir recursively copies regular files and directories from src into dst.
+// Non-regular entries (symlinks, pipes, sockets, devices) are skipped with a
+// warning. Any entry whose name exactly matches one of the exclude values is
+// skipped (only at the top level of src).
+func copyDir(src, dst string, exclude ...string) error {
+	srcInfo, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+		return err
+	}
+	if err := os.Chmod(dst, srcInfo.Mode()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if slices.Contains(exclude, entry.Name()) {
+			continue
+		}
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if !entry.Type().IsRegular() {
+			klog.Warningf("copyDir: skipping non-regular file %s (type %s)", srcPath, entry.Type())
+			continue
+		}
+		if err := copyFile(srcPath, dstPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	info, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode())
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	if _, err = io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+	return os.Chmod(dst, info.Mode())
+}
+
+// checkDiskSpace returns an error if the available space on the filesystem
+// containing dstPath is smaller than the used space on the filesystem
+// containing srcPath.
+func checkDiskSpace(srcPath, dstPath string) error {
+	var srcStat, dstStat syscall.Statfs_t
+	if err := syscall.Statfs(srcPath, &srcStat); err != nil {
+		return fmt.Errorf("failed to stat source filesystem: %w", err)
+	}
+	if err := syscall.Statfs(dstPath, &dstStat); err != nil {
+		return fmt.Errorf("failed to stat destination filesystem: %w", err)
+	}
+
+	usedBytes := int64(srcStat.Blocks-srcStat.Bfree) * int64(srcStat.Bsize)
+	availableBytes := int64(dstStat.Bavail) * int64(dstStat.Bsize)
+	if usedBytes > availableBytes {
+		return fmt.Errorf("need ~%d bytes, only %d available", usedBytes, availableBytes)
+	}
+	return nil
 }

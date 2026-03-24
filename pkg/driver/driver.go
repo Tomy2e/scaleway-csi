@@ -49,6 +49,9 @@ type DriverConfig struct {
 	Prefix string
 	// Plugin mode.
 	Mode Mode
+	// UnsafeLocalCopy enables copying volume data to a local directory on stage,
+	// serving it via bind mount, and writing back to the volume on unstage.
+	UnsafeLocalCopy bool
 }
 
 // Driver implements the interfaces csi.IdentityServer, csi.ControllerServer and csi.NodeServer.
@@ -108,7 +111,7 @@ func NewDriver(config *DriverConfig) (*Driver, error) {
 	}
 
 	if node {
-		nodeService, err := newNodeService()
+		nodeService, err := newNodeService(config)
 		if err != nil {
 			return nil, err
 		}

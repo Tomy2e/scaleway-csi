@@ -10,10 +10,11 @@ import (
 )
 
 var (
-	endpoint = flag.String("endpoint", "unix:/tmp/csi.sock", "CSI endpoint")
-	prefix   = flag.String("prefix", "", "Prefix to add in block volume name")
-	version  = flag.Bool("version", false, "Print the version and exit")
-	mode     = flag.String("mode", string(driver.AllMode), "The mode in which the CSI driver will be run (all, node, controller)")
+	endpoint        = flag.String("endpoint", "unix:/tmp/csi.sock", "CSI endpoint")
+	prefix          = flag.String("prefix", "", "Prefix to add in block volume name")
+	version         = flag.Bool("version", false, "Print the version and exit")
+	mode            = flag.String("mode", string(driver.AllMode), "The mode in which the CSI driver will be run (all, node, controller)")
+	unsafeLocalCopy = flag.Bool("unsafe-local-copy", false, "Copy volume data to a local directory on stage and write back on unstage. Data loss can occur if the node crashes before unstage completes.")
 )
 
 func main() {
@@ -28,9 +29,10 @@ func main() {
 	}
 
 	scwDriver, err := driver.NewDriver(&driver.DriverConfig{
-		Endpoint: *endpoint,
-		Mode:     driver.Mode(*mode),
-		Prefix:   *prefix,
+		Endpoint:        *endpoint,
+		Mode:            driver.Mode(*mode),
+		Prefix:          *prefix,
+		UnsafeLocalCopy: *unsafeLocalCopy,
 	})
 	if err != nil {
 		klog.Fatalln(err)

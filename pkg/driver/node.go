@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"os"
 	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -28,9 +27,13 @@ type nodeService struct {
 	nodeID            string
 	nodeZone          scw.Zone
 	maxVolumesPerNode int64
+
+	unsafeLocalCopy  bool
+	localCopyMntDir  string
+	localCopyDataDir string
 }
 
-func newNodeService() (*nodeService, error) {
+func newNodeService(config *DriverConfig) (*nodeService, error) {
 	metadata, err := scaleway.GetMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("unable to fetch Scaleway metadata: %w", err)
@@ -46,11 +49,16 @@ func newNodeService() (*nodeService, error) {
 		return nil, err
 	}
 
+	localCopyMntDir, localCopyDataDir := localCopyDirs()
+
 	return &nodeService{
 		diskUtils:         newDiskUtils(),
 		nodeID:            metadata.ID,
 		nodeZone:          zone,
 		maxVolumesPerNode: maxVolumesPerNode,
+		unsafeLocalCopy:   config.UnsafeLocalCopy,
+		localCopyMntDir:   localCopyMntDir,
+		localCopyDataDir:  localCopyDataDir,
 	}, nil
 }
 
@@ -154,7 +162,11 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 
 	klog.V(4).Infof("Volume %s with ID %s will be mounted on %s with type %s and options %s", volumeName, volumeID, stagingTargetPath, fsType, strings.Join(mountOptions, ","))
 
-	// format and mounting volume
+	if d.unsafeLocalCopy {
+		return d.stageLocalCopy(volumeID, volumeName, stagingTargetPath, devicePath, fsType, mountOptions)
+	}
+
+	// format and mount volume directly to staging target path
 	if err := d.diskUtils.FormatAndMount(stagingTargetPath, devicePath, fsType, mountOptions); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to format and mount device from (%q) to (%q) with fstype (%q) and options (%q): %s",
 			devicePath, stagingTargetPath, fsType, mountOptions, err)
@@ -188,15 +200,17 @@ func (d *nodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 		return nil, status.Error(codes.InvalidArgument, "stagingTargetPath not provided")
 	}
 
+	if d.unsafeLocalCopy {
+		if err := d.unstageLocalCopy(volumeID, stagingTargetPath); err != nil {
+			return nil, err
+		}
+	}
+
 	if _, err = d.diskUtils.GetDevicePath(volumeID); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, status.Errorf(codes.NotFound, "volume with ID %s not found", volumeID)
 		}
 		return nil, status.Errorf(codes.Internal, "error getting device path for volume with ID %s: %s", volumeID, err.Error())
-	}
-
-	if _, err := os.Stat(stagingTargetPath); errors.Is(err, fs.ErrNotExist) {
-		return nil, status.Errorf(codes.NotFound, "volume with ID %s not found on node", volumeID)
 	}
 
 	if d.diskUtils.IsMounted(stagingTargetPath) {
